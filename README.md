@@ -369,20 +369,6 @@ Logs will appear in **Settings → System → Logs**.
 
 ---
 
-## Support
-
-Join the community Discord server for help, feedback and discussion:
-
-[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white)](https://discord.gg/8kmYsP6ZRv)
-
-If you find this integration useful, you can support its development:
-
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/d3dfantasy99)
-
-To report a bug or request a feature, please [open an issue](https://github.com/randrcomputers/ha-lymow/issues) on GitHub.
-
----
-
 ## Disclaimer
 
 This integration communicates with Lymow's AWS infrastructure (Cognito, API Gateway, IoT MQTT, S3) using credentials obtained by reverse engineering the official Android app. All commands are sent over MQTT — no IoT shadow writes are used. Use at your own risk. The API may change at any time without notice.
