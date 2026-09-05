@@ -1,61 +1,54 @@
-"""Lymow camera platform.
+"""Lymow camera platform: the diagnostic Map camera + the live RTSP/HLS stream camera.
 
-Two cameras:
-  - LymowMapCamera   : diagnostic PNG rendered with Pillow (executor-safe).
-  - LymowRTSPCamera  : live RTSP stream via HA's built-in `stream` component.
-                       The camera card in Lovelace will show a live HLS feed
-                       as long as the robot IP is reachable from the HA host.
+The heavy map rendering lives in map_render.py; LymowMapCamera here just calls build_map_png().
 """
 from __future__ import annotations
 
-import io
+import asyncio
+import contextlib
 import logging
-import math
+import multiprocessing
+import os
+import shutil
+import tempfile
+import threading
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from typing import Any
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, Event, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
-from .const import DOMAIN, F_IP_ADDRESS, F_NET_DETAIL, RTSP_PATH, RTSP_PORT
+from .const import (
+    DEFAULT_RENDER_MULTIPROCESSING,
+    DOMAIN,
+    F_IP_ADDRESS,
+    F_NET_DETAIL,
+    RTSP_PATH,
+    RTSP_PORT,
+)
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
+from .map_render import build_map_png, text_png, safe_points, Image, _PIL_ERROR
 
 _LOGGER = logging.getLogger(__name__)
 
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except Exception as exc:
-    Image = ImageDraw = ImageFont = None
-    _PIL_ERROR = repr(exc)
-else:
-    _PIL_ERROR = None
-
-W = H = 800
-PAD = 40
-# All colours as RGBA tuples (image is created in RGBA mode and converted to RGB at save time)
-BG          = (17,  24,  39, 255)
-GREEN       = (34, 197,  94, 110)
-GREEN_LINE  = (134, 239, 172, 230)
-WHITE       = (255, 255, 255, 255)
-GREY        = (156, 163, 175, 255)
-ORANGE      = (249, 115,  22, 255)
-YELLOW      = (251, 191,  36, 255)
-RED         = (248, 113, 113, 255)
-BLACK       = (  0,   0,   0, 255)
-
-FALLBACK_PNG = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
-    b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
-)
-
 
 def _get_robot_ip(data: dict) -> str | None:
+    # netDetailInfo is stored as the raw protobuf message (no `.get()`); state.py
+    # flattens wifiIp to a top-level key. Read the flat key, fall back to the object
+    # via getattr — never `.get()` on the protobuf object (raised AttributeError).
+    nd = data.get(F_NET_DETAIL)
+    nd_wifi_ip = nd.get("wifiIp") if isinstance(nd, dict) else getattr(nd, "wifiIp", None)
     return (
         data.get(F_IP_ADDRESS)
-        or (data.get(F_NET_DETAIL) or {}).get("wifiIp")
+        or data.get("wifiIp")
+        or nd_wifi_ip
         or data.get("rest_ip_address")
     )
 
@@ -67,7 +60,7 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowMapCamera(coord), LymowRTSPCamera(coord)],
+        [LymowMapCamera(coord, entry), LymowRTSPCamera(coord)],
         update_before_add=False,
     )
 
@@ -80,28 +73,114 @@ class LymowMapCamera(LymowEntity, Camera):
     _attr_content_type = "image/png"
     _attr_supported_features = CameraEntityFeature(0)
 
-    def __init__(self, coordinator: LymowCoordinator) -> None:
+    def __init__(self, coordinator: LymowCoordinator, entry: ConfigEntry) -> None:
         LymowEntity.__init__(self, coordinator, "map")
         Camera.__init__(self)
         self._render_error: str | None = None
         self._render_debug: dict[str, Any] = {}
+        # Single-flight render guard. HA can call async_camera_image concurrently (multiple
+        # dashboard viewers / rapid polling); a map render takes seconds, so without this the
+        # executor pool fills with duplicate renders and HA goes unresponsive. Render at most
+        # ONE map at a time; concurrent callers get the last finished frame. [xar]
+        self._render_lock = threading.Lock()
+        self._render_last_img: bytes | None = None
+        # Optionally run the GIL-bound map render in a separate process so the heavy
+        # coverage math never blocks HA's event loop. [xar]
+        self._multiprocessing = entry.options.get(
+            "render_multiprocessing", DEFAULT_RENDER_MULTIPROCESSING
+        )
+        self._executor: ProcessPoolExecutor | None = None
 
     @property
     def available(self) -> bool:
         return self.coordinator.last_update_success
 
+    # ── lifecycle ────────────────────────────────────────────────
+
+    @callback
+    def _on_hass_stop(self, event: Event) -> None:
+        self._disable_process_pool()
+
+    def _disable_process_pool(self) -> None:
+        """Drop a dead or shutting-down process pool. Once BrokenProcessPool
+        fires the executor is permanently unusable until it is replaced."""
+        executor = self._executor
+        self._executor = None
+        self._multiprocessing = False
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+        except Exception:
+            _LOGGER.debug("Lymow map process pool shutdown failed", exc_info=True)
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._multiprocessing and self._executor is None:
+            # spawn (not fork) — fork is unsafe alongside asyncio/threads. One worker
+            # is enough; the render single-flight lock already serializes calls.
+            self._executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+            self.async_on_remove(self._executor.shutdown)
+            self.async_on_remove(
+                self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._on_hass_stop)
+            )
+
     # ── sync render (always called in executor) ──────────────────
 
     def _render(self) -> bytes:
+        # If a render is already running on another executor thread, don't pile on — hand back
+        # the last finished frame (or a placeholder until the first one lands). Non-blocking, so
+        # a slow render can never exhaust the executor pool and hang HA. [xar]
+        if not self._render_lock.acquire(blocking=False):
+            return self._render_last_img or text_png("Lymow map", "rendering…")
         try:
-            img, dbg = build_map_png(self.coordinator.data or {})
-            self._render_debug = dbg
-            self._render_error = None
-            return png_bytes(img)
-        except Exception as exc:
-            self._render_error = f"{type(exc).__name__}: {exc}"
-            _LOGGER.exception("Lymow diagnostic map render failed")
-            return text_png("Lymow map render failed", self._render_error)
+            try:
+                imperial = self.hass.config.units is US_CUSTOMARY_SYSTEM
+                name = (
+                    self.coordinator.config_entry.data.get("device_name")
+                    or (self.coordinator.device_info_data or {}).get("deviceName")
+                    or (self.coordinator.data or {}).get("deviceName")
+                    or "Lymow"
+                )
+                coord_data = self.coordinator.data or {}
+                if self._multiprocessing and self._executor is not None:
+                    # Heavy coverage math is GIL-bound pure Python → run it in a separate
+                    # process so HA's event loop stays responsive. Pass only builtin-typed
+                    # top-level values: drops un-picklable protobuf objects; the coverage
+                    # masks are plain dict/list so they survive. [xar]
+                    render_data = {
+                        k: v for k, v in coord_data.items()
+                        if type(v).__module__ == "builtins"
+                    }
+                    try:
+                        data, dbg = self._executor.submit(
+                            build_map_png, render_data, imperial=imperial, device_name=name
+                        ).result()
+                    except BrokenProcessPool:
+                        _LOGGER.warning(
+                            "Lymow map process pool died; falling back to in-process render"
+                        )
+                        self._disable_process_pool()
+                        data, dbg = build_map_png(
+                            coord_data, imperial=imperial, device_name=name
+                        )
+                else:
+                    data, dbg = build_map_png(coord_data, imperial=imperial, device_name=name)
+                self._render_debug = dbg
+                self._render_error = None
+            except Exception as exc:
+                self._render_error = f"{type(exc).__name__}: {exc}"
+                _LOGGER.exception("Lymow diagnostic map render failed")
+                data = text_png("Lymow map render failed", self._render_error)
+            self._render_last_img = data       # cache inside the lock so it's always consistent
+            return data
+        finally:
+            self._render_lock.release()         # always release, even on an unexpected error
 
     # ── camera interface ─────────────────────────────────────────
 
@@ -150,7 +229,11 @@ class LymowMapCamera(LymowEntity, Camera):
                     "from": _zname.get(c.get("zone1")) or c.get("zone1"),
                     "to": _zname.get(c.get("zone2")) or c.get("zone2"),
                     "points": c.get("points_count", len(c.get("points") or [])),
+                    "xy": [(round(x, 1), round(y, 1)) for x, y in safe_points(c.get("points") or [])],
                     "docking": bool(c.get("isDockingChannel")),
+                    "detect_mode": c.get("detectMode"),
+                    "cut_height": c.get("cutHeight"),
+                    "channel_lift": c.get("channelLift"),
                 }
                 for c in channels
                 if isinstance(c, dict)
@@ -161,26 +244,21 @@ class LymowMapCamera(LymowEntity, Camera):
                 if isinstance(z, dict) and z.get("points")
             ),
             "has_enu_base_point": bool(btmap.get("enuBasePoint") or d.get("enu_base_point")),
+            # Per-zone mow config — cleanMode (3=cross/double), cleanDir (configured cut direction;
+            # -1=optimized/auto), pathSpacing. Lets the pass classifier use the KNOWN directions.
+            "zones_cfg": [
+                {"name": z.get("name"),
+                 "cleanMode": (z.get("zoneConfig") or {}).get("cleanMode"),
+                 "cleanDir": (z.get("zoneConfig") or {}).get("cleanDir"),            # stripe angle
+                 "relativeCleanDir": (z.get("zoneConfig") or {}).get("relativeCleanDir"),  # cross-cut angle
+                 "perimeterMowDir": (z.get("zoneConfig") or {}).get("perimeterMowDir"),
+                 "pathSpacing": (z.get("zoneConfig") or {}).get("pathSpacing")}
+                for z in zones if isinstance(z, dict)
+            ],
         }
 
 
 # ── RTSP live camera ─────────────────────────────────────────────────────────
-
-import asyncio
-import contextlib
-import os
-import shutil
-import socket
-import tempfile
-import threading
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-
-
-def _find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
 
 class LymowRTSPCamera(LymowEntity, Camera):
     """Live camera via FFmpeg HLS proxy → HA stream component.
@@ -190,11 +268,19 @@ class LymowRTSPCamera(LymowEntity, Camera):
     segments served by a local HTTP server, and HA's stream component picks
     up the playlist.  This works around HA's hard-coded libav probe timeout
     which is too short for the mower's LIVE555 server.
+
+    A watchdog task monitors the FFmpeg process and restarts it automatically
+    if it exits unexpectedly (e.g. stream drop, mower out of range). An
+    asyncio.Lock serialises all start/stop operations so rapid coordinator
+    updates can't produce overlapping proxy instances.
     """
 
     _attr_name = "Live Camera"
     _attr_icon = "mdi:cctv"
     _attr_supported_features = CameraEntityFeature.STREAM
+
+    # How often the watchdog polls the FFmpeg process for unexpected exits.
+    _WATCHDOG_INTERVAL = 15  # seconds
 
     def __init__(self, coordinator: LymowCoordinator) -> None:
         LymowEntity.__init__(self, coordinator, "rtsp_camera")
@@ -206,6 +292,8 @@ class LymowRTSPCamera(LymowEntity, Camera):
         self._hls_port: int | None = None
         self._hls_dir: str | None = None
         self._proxy_source_ip: str | None = None  # IP used when proxy was started
+        self._proxy_lock = asyncio.Lock()           # serialises start/stop ops
+        self._watchdog_task: asyncio.Task | None = None
 
     @property
     def available(self) -> bool:
@@ -222,14 +310,25 @@ class LymowRTSPCamera(LymowEntity, Camera):
         # Start proxy now if IP is already known; otherwise the coordinator
         # listener below will start it when data first arrives.
         if self._rtsp_url():
-            await self._start_hls_proxy()
-        # Listen for coordinator updates so we can (re)start when IP appears
+            await self._restart_hls_proxy()
+        # Listen for coordinator updates so we can (re)start when IP appears.
         self.async_on_remove(
             self.coordinator.async_add_listener(self._async_on_coordinator_update)
         )
+        # Launch the watchdog.
+        self._watchdog_task = self.hass.async_create_background_task(
+            self._watchdog(), name="lymow_camera_watchdog"
+        )
+        self.async_on_remove(self._cancel_watchdog)
 
     async def async_will_remove_from_hass(self) -> None:
+        self._cancel_watchdog()
         await self._stop_hls_proxy()
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+        self._watchdog_task = None
 
     def _async_on_coordinator_update(self) -> None:
         """Restart proxy if the robot IP changed or proxy isn't running yet."""
@@ -239,23 +338,52 @@ class LymowRTSPCamera(LymowEntity, Camera):
         if self._proxy_process is None or current_ip != self._proxy_source_ip:
             self.hass.async_create_task(self._restart_hls_proxy())
 
-    async def _restart_hls_proxy(self) -> None:
-        await self._stop_hls_proxy()
-        await self._start_hls_proxy()
+    # ── watchdog ─────────────────────────────────────────────────
+
+    async def _watchdog(self) -> None:
+        """Periodically check that FFmpeg is still running; restart if not."""
+        while True:
+            await asyncio.sleep(self._WATCHDOG_INTERVAL)
+            proc = self._proxy_process
+            if proc is not None and proc.returncode is not None:
+                # Collect any stderr output that was buffered before exit.
+                stderr_out = ""
+                if proc.stderr is not None:
+                    with contextlib.suppress(Exception):
+                        raw = await asyncio.wait_for(proc.stderr.read(4096), timeout=1.0)
+                        stderr_out = raw.decode(errors="replace").strip()
+                _LOGGER.warning(
+                    "Lymow HLS proxy exited unexpectedly (rc=%s)%s — restarting",
+                    proc.returncode,
+                    f": {stderr_out}" if stderr_out else "",
+                )
+                await self._restart_hls_proxy()
 
     # ── proxy management ─────────────────────────────────────────
 
-    async def _start_hls_proxy(self) -> None:
+    async def _restart_hls_proxy(self) -> None:
+        """Stop then start the proxy, serialised by _proxy_lock."""
+        async with self._proxy_lock:
+            await self._stop_hls_proxy_unlocked()
+            await self._start_hls_proxy_unlocked()
+
+    async def _stop_hls_proxy(self) -> None:
+        """Public stop — acquires the lock."""
+        async with self._proxy_lock:
+            await self._stop_hls_proxy_unlocked()
+
+    async def _start_hls_proxy_unlocked(self) -> None:
+        """Start the FFmpeg HLS proxy. Must be called with _proxy_lock held."""
         url = self._rtsp_url()
         if not url:
             _LOGGER.debug("Lymow camera: no robot IP, skipping HLS proxy start")
             return
 
         self._hls_dir = tempfile.mkdtemp(prefix="lymow_hls_")
-        self._hls_port = _find_free_port()
         self._proxy_source_ip = _get_robot_ip(self.coordinator.data or {})
 
-        # Tiny HTTP server that serves HLS segments from the temp dir
+        # Bind to port 0 and let the OS assign a free port — avoids the
+        # TOCTOU race of finding a free port then binding separately.
         hls_dir = self._hls_dir
 
         class _QuietHandler(SimpleHTTPRequestHandler):
@@ -265,30 +393,34 @@ class LymowRTSPCamera(LymowEntity, Camera):
             def log_message(self, format, *args):  # noqa: A002
                 pass  # suppress per-request noise in HA logs
 
-        self._http_server = HTTPServer(("127.0.0.1", self._hls_port), _QuietHandler)
+        self._http_server = HTTPServer(("127.0.0.1", 0), _QuietHandler)
+        self._hls_port = self._http_server.server_address[1]
         self._http_thread = threading.Thread(
             target=self._http_server.serve_forever, daemon=True, name="lymow_hls_http"
         )
         self._http_thread.start()
         _LOGGER.debug("Lymow HLS HTTP server started on port %s", self._hls_port)
 
-        # FFmpeg: RTSP in (TCP, generous probe) → HLS out
+        # FFmpeg: RTSP in (TCP, generous probe) → HLS out.
+        # stderr is captured via PIPE so the watchdog can log it on exit.
         self._proxy_process = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-loglevel", "warning",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
             "-rtsp_transport", "tcp",
             "-analyzeduration", "3000000",   # 3 s — waits for first IDR frame
             "-probesize", "5000000",
             "-i", url,
             "-c:v", "copy",                  # no re-encode; just remux
             "-f", "hls",
-            "-hls_time", "1",                # 1-second segments → low latency
-            "-hls_list_size", "3",           # rolling 3-segment window
-            "-hls_flags", "delete_segments+append_list",
+            "-hls_time", "2",                # 2-second segments — smoother than 1 s
+            "-hls_list_size", "5",           # 10-second rolling window
+            "-hls_flags", "delete_segments+append_list+program_date_time+independent_segments",
             "-hls_segment_filename", os.path.join(self._hls_dir, "seg%03d.ts"),
             os.path.join(self._hls_dir, "stream.m3u8"),
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,  # captured for watchdog diagnostics
         )
         _LOGGER.debug(
             "Lymow FFmpeg HLS proxy started (pid=%s) → %s",
@@ -296,7 +428,8 @@ class LymowRTSPCamera(LymowEntity, Camera):
             url,
         )
 
-    async def _stop_hls_proxy(self) -> None:
+    async def _stop_hls_proxy_unlocked(self) -> None:
+        """Stop the proxy. Must be called with _proxy_lock held."""
         if self._proxy_process:
             with contextlib.suppress(ProcessLookupError):
                 self._proxy_process.terminate()
@@ -341,233 +474,3 @@ class LymowRTSPCamera(LymowEntity, Camera):
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         return await self.hass.async_add_executor_job(self.camera_image, width, height)
-
-
-# ── Rendering helpers ────────────────────────────────────────────────────────
-
-def build_map_png(data: dict) -> tuple:
-    if Image is None or ImageDraw is None:
-        raise RuntimeError(f"Pillow not available: {_PIL_ERROR}")
-
-    # Use RGBA throughout; convert to RGB only when saving.
-    img  = Image.new("RGBA", (W, H), BG)
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    btmap    = data.get("btMap") or {}
-    zones    = btmap.get("zones") or []
-    drawable = [
-        z for z in zones
-        if z.get("points") and len(z.get("points") or []) >= 2
-    ]
-
-    nogo_zones = btmap.get("nogoZones") or []
-    drawable_nogo = [
-        z for z in nogo_zones
-        if z.get("points") and len(z.get("points") or []) >= 3
-    ]
-
-    dbg = {
-        "zones":        len(zones),
-        "drawable":     len(drawable),
-        "first_points": len(zones[0].get("points") or []) if zones else 0,
-        "channels":     len((btmap.get("channels") or [])),
-        "nogo_zones":   len(nogo_zones),
-        "drawable_nogo": len(drawable_nogo),
-    }
-
-    draw_text(draw, "Lymow Map Diagnostic", 20, 16, 22, WHITE)
-    draw_text(
-        draw,
-        f"zones={len(zones)} drawable={len(drawable)} first_pts={dbg['first_points']}",
-        20, 46, 15, GREY,
-    )
-
-    if not drawable:
-        draw_text(draw, "No drawable polygons in state", 20, 100, 18, RED)
-        return img.convert("RGB"), dbg
-
-    all_pts: list[tuple[float, float]] = []
-    for z in drawable:
-        all_pts.extend(safe_points(z.get("points") or []))
-
-    if not all_pts:
-        draw_text(draw, "Drawable zones exist but points failed to parse", 20, 100, 18, RED)
-        return img.convert("RGB"), dbg
-
-    min_x = min(x for x, y in all_pts)
-    max_x = max(x for x, y in all_pts)
-    min_y = min(y for x, y in all_pts)
-    max_y = max(y for x, y in all_pts)
-    dbg.update({"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y})
-
-    scale = (W - PAD * 2) / max(max_x - min_x or 1, max_y - min_y or 1)
-
-    def sx(x: float) -> float: return (x - min_x) * scale + PAD
-    def sy(y: float) -> float: return H - ((y - min_y) * scale + PAD)
-
-    # Channels / corridors — draw behind zone outlines.
-    for channel in (btmap.get("channels") or []):
-        pts = safe_points(channel.get("points") or [])
-        if len(pts) < 2:
-            continue
-        if len(pts) > 300:
-            step = max(1, math.ceil(len(pts) / 300))
-            pts = pts[::step]
-        xy = [(sx(x), sy(y)) for x, y in pts]
-        if len(xy) >= 3:
-            draw.line(xy + [xy[0]], fill=YELLOW, width=2)
-        elif len(xy) >= 2:
-            draw.line(xy, fill=YELLOW, width=2)
-
-    for idx, zone in enumerate(drawable):
-        pts = safe_points(zone.get("points") or [])
-        if len(pts) > 300:
-            step = max(1, math.ceil(len(pts) / 300))
-            pts  = pts[::step]
-        xy = [(sx(x), sy(y)) for x, y in pts]
-        if len(xy) >= 3:
-            draw.polygon(xy, fill=GREEN, outline=GREEN_LINE)
-            cx = sum(p[0] for p in xy) / len(xy)
-            cy = sum(p[1] for p in xy) / len(xy)
-            label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
-            draw_center(draw, label, cx, cy, 10, WHITE)
-    
-    # No-go zones / excluded areas — orange overlay
-    for idx, zone in enumerate(drawable_nogo):
-        pts = safe_points(zone.get("points") or [])
-        if len(pts) < 3:
-            continue
-
-        if len(pts) > 300:
-            step = max(1, math.ceil(len(pts) / 300))
-            pts = pts[::step]
-
-        xy = [(sx(x), sy(y)) for x, y in pts]
-
-        if xy and xy[0] != xy[-1]:
-            xy.append(xy[0])
-
-        try:
-            draw.polygon(
-                xy,
-                fill=(249, 115, 22, 130),      # orange transparent
-                outline=(251, 146, 60, 240),   # orange border
-            )
-
-            cx = sum(p[0] for p in xy) / len(xy)
-            cy = sum(p[1] for p in xy) / len(xy)
-            label = str(zone.get("name") or zone.get("hashId") or f"No-Go {idx + 1}")[:14]
-            draw_center(draw, label, cx, cy, 9, WHITE)
-
-        except Exception:
-            pass
-
-    # Mowed Poligons QUERY_PATH
-    mowed_polygons = data.get("mowed_area_polygons") or []
-    for poly in mowed_polygons:
-        pts = safe_points(poly)
-        if len(pts) < 3:
-            continue
-
-        if len(pts) > 800:
-            step = max(1, math.ceil(len(pts) / 800))
-            pts = pts[::step]
-
-        xy = [(sx(x), sy(y)) for x, y in pts]
-
-        if xy and xy[0] != xy[-1]:
-            xy.append(xy[0])
-
-        draw.polygon(
-            xy,
-            fill=(59, 130, 246, 90),
-            outline=(37, 99, 235, 220),
-        )
-    dbg.update({
-        "mowed_area_polygons": len(mowed_polygons),
-        "mowed_area_points": sum(len(safe_points(poly)) for poly in mowed_polygons),
-    })     
-
-    dock = data.get("chargingStationLoc")
-    if isinstance(dock, dict):
-        x, y = to_float(dock.get("x")), to_float(dock.get("y"))
-        if x is not None and y is not None:
-            dx, dy = sx(x), sy(y)
-            draw.ellipse((dx - 10, dy - 10, dx + 10, dy + 10), fill=YELLOW, outline=WHITE, width=2)
-            draw_center(draw, "D", dx, dy, 11, BLACK)
-
-    robot = data.get("robotLoc") or data.get("pose") or data.get("robotPosePib")
-    if isinstance(robot, dict):
-        x, y = to_float(robot.get("x")), to_float(robot.get("y"))
-        if x is not None and y is not None:
-            rx, ry = sx(x), sy(y)
-            draw.ellipse((rx - 9, ry - 9, rx + 9, ry + 9), fill=ORANGE, outline=WHITE, width=2)
-            draw_center(draw, "R", rx, ry, 11, WHITE)
-
-    return img.convert("RGB"), dbg
-
-
-def text_png(title: str, subtitle: str) -> bytes:
-    if Image is None or ImageDraw is None:
-        return FALLBACK_PNG
-    img  = Image.new("RGBA", (W, H), BG)
-    draw = ImageDraw.Draw(img, "RGBA")
-    draw_center(draw, title,    W / 2, H / 2 - 16, 22, WHITE)
-    draw_center(draw, subtitle, W / 2, H / 2 + 18, 13, GREY)
-    return png_bytes(img.convert("RGB"))
-
-
-def png_bytes(img) -> bytes:
-    bio = io.BytesIO()
-    img.save(bio, format="PNG")
-    return bio.getvalue()
-
-
-def font(size: int):
-    if ImageFont is None:
-        return None
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def draw_text(draw, text: str, x: float, y: float, size: int, fill) -> None:
-    draw.text((x, y), str(text), font=font(size), fill=fill)
-
-
-def draw_center(draw, text: str, x: float, y: float, size: int, fill) -> None:
-    f    = font(size)
-    text = str(text)
-    try:
-        box     = draw.textbbox((0, 0), text, font=f)
-        tw, th  = box[2] - box[0], box[3] - box[1]
-    except Exception:
-        tw, th = len(text) * size * 0.6, size
-    draw.text((x - tw / 2, y - th / 2), text, font=f, fill=fill)
-
-
-def to_float(v: Any) -> float | None:
-    try:
-        return None if v is None else float(v)
-    except Exception:
-        return None
-
-
-def safe_points(points: list[Any]) -> list[tuple[float, float]]:
-    """Normalise zone points regardless of storage format.
-
-    Stored as dicts {x, y} from older MQTT path or as tuples (x, y)
-    from decode_map_fields / S3 backup map.
-    """
-    out: list[tuple[float, float]] = []
-    for p in points:
-        if isinstance(p, dict):
-            x, y = to_float(p.get("x")), to_float(p.get("y"))
-        elif isinstance(p, (list, tuple)) and len(p) >= 2:
-            x, y = to_float(p[0]), to_float(p[1])
-        else:
-            continue
-        if x is not None and y is not None:
-            out.append((x, y))
-    return out

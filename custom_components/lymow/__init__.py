@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import logging
 
-import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import CognitoAuth, LymowClient
@@ -19,9 +18,6 @@ from .const import (
     CONF_PASSWORD,
     CONF_REGION,
     DOMAIN,
-    SERVICE_SET_BLADE,
-    SERVICE_SET_SCHEDULE,
-    SERVICE_START_ZONE,
 )
 from .config_flow import LymowOAuthStartView
 from .coordinator import LymowCoordinator
@@ -69,18 +65,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         auth.from_dict(entry.data)
         try:
             await auth.ensure_valid(email or None, password or None)
-        except Exception:
+        except Exception as err:
             if auth_method == AUTH_METHOD_GOOGLE:
-                _LOGGER.error("Google OAuth tokens expired for %s — reconfigure the integration", thing_name)
-                raise
+                # Refresh token expired/revoked — Google users have no stored
+                # credential to silently re-login with. Raise ConfigEntryAuthFailed
+                # so HA starts the reauth flow (re-authenticate in place, keep history).
+                _LOGGER.warning(
+                    "Google OAuth session expired for %s — re-authentication required",
+                    thing_name,
+                )
+                raise ConfigEntryAuthFailed(
+                    "Google OAuth session expired — please re-authenticate"
+                ) from err
             _LOGGER.warning("Stored tokens invalid for %s — re-logging in", thing_name)
+            try:
+                await auth.login(email, password)
+                await auth.get_aws_credentials()
+            except Exception as err2:
+                raise ConfigEntryAuthFailed(
+                    "Lymow login failed — please re-authenticate"
+                ) from err2
+    elif email and password:
+        try:
             await auth.login(email, password)
             await auth.get_aws_credentials()
-    elif email and password:
-        await auth.login(email, password)
-        await auth.get_aws_credentials()
+        except Exception as err:
+            raise ConfigEntryAuthFailed(
+                "Lymow login failed — please re-authenticate"
+            ) from err
     else:
-        raise Exception("No credentials available — reconfigure the integration")
+        raise ConfigEntryAuthFailed(
+            "No stored credentials — please re-authenticate"
+        )
 
     client = LymowClient(region, auth, session)
 
@@ -92,6 +108,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         region=region,
         email=email,
         password=password,
+        config_entry=entry,
     )
 
     # Store reference so entity platforms can find it
@@ -120,7 +137,7 @@ def _register_services(hass: HomeAssistant) -> None:
     from homeassistant.exceptions import HomeAssistantError
     import voluptuous as vol
     from homeassistant.helpers import config_validation as cv, device_registry as dr
-    from .protocol import encode_userctrl, encode_start_zones
+    from .protocol import encode_userctrl, encode_start_zones, encode_play_audio
     from .const import USER_CTRL_RECHARGE_DOCK, USER_CTRL_FORCE_REINIT
  
     if hass.services.has_service(DOMAIN, "start_zones"):
@@ -194,6 +211,12 @@ def _register_services(hass: HomeAssistant) -> None:
         """Force-reinit: stop in place, reset to waiting ('Cancel task' in app)."""
         coord = _get_coordinator(call)
         coord._publish(encode_userctrl(USER_CTRL_FORCE_REINIT))
+
+    async def _handle_play_sound(call: ServiceCall) -> None:
+        """Play a voice prompt / sound on the mower (PbInput.audioId). Experiment
+        with audio_id (0-33, see AudioId table) to find a good locate beep."""
+        coord = _get_coordinator(call)
+        coord._publish(encode_play_audio(int(call.data["audio_id"])))
  
     hass.services.async_register(
         DOMAIN, "start_zones", _handle_start_zones,
@@ -209,6 +232,13 @@ def _register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, "cancel_task", _handle_cancel_task,
         schema=vol.Schema({vol.Optional("device_id"): vol.Any(str, [str])}),
+    )
+    hass.services.async_register(
+        DOMAIN, "play_sound", _handle_play_sound,
+        schema=vol.Schema({
+            vol.Optional("device_id"): vol.Any(str, [str]),
+            vol.Required("audio_id"): vol.All(vol.Coerce(int), vol.Range(min=0, max=33)),
+        }),
     )
 
 

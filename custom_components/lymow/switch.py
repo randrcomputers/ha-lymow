@@ -20,6 +20,7 @@ from homeassistant.components.switch import SwitchEntity, SwitchEntityDescriptio
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
@@ -175,9 +176,36 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord), LymowDockOnErrorSwitch(coord)],
+        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord), LymowDockOnErrorSwitch(coord), LymowRainyMowingSwitch(coord), LymowDiagnosticCaptureSwitch(coord), LymowDimByAgeSwitch(coord)],
         update_before_add=False,
     )
+
+
+class LymowRainyMowingSwitch(LymowEntity, SwitchEntity):
+    """Rainy Mowing (taskConfig.rainCleaning): ON = keep mowing when the rain
+    sensor triggers; OFF = dock and wait for dry (recommended — wet mowing clogs
+    the deck and leaves grass juice on the charge contacts)."""
+
+    _attr_name = "Rainy Mowing"
+    _attr_icon = "mdi:weather-pouring"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "rainy_mowing_switch")
+
+    @property
+    def is_on(self) -> bool:
+        # rainCleaning is a proto3 bool: false (the default + recommended setting)
+        # is never transmitted, so it reads None after a reload. Default to False
+        # so the entity has a KNOWN state and renders as the normal pill toggle —
+        # not the "unknown" two-button (lightning-bolt) control. A True setting is
+        # restored from the sticky store (rainCleaning in _STICKY_KEYS).
+        return bool((self.coordinator.data or {}).get("rainCleaning"))
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self.coordinator.async_set_rainy_mowing(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.coordinator.async_set_rainy_mowing(False)
 
 class LymowSwitch(LymowEntity, SwitchEntity):
     """Lymow switch entity."""
@@ -261,6 +289,67 @@ class LymowHeadlightsSwitch(LymowEntity, SwitchEntity):
         }
 
 
+class LymowVehicleLedSwitch(LymowEntity, SwitchEntity):
+    """Vehicle LEDs — the indicator LEDs on top of the mower plus the LCD backlight.
+
+    Distinct from the headlight/camera LED. Unlike the camera LED, the firmware does
+    NOT auto-off these on dock/charge, so they stay lit at night unless turned off —
+    which makes an HA automation (off while docked, on while off-dock) useful.
+    """
+
+    _attr_name = "Vehicle LEDs"
+    _attr_icon = "mdi:led-on"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "vehicle_led")
+
+    @property
+    def is_on(self) -> bool | None:
+        d = self.coordinator.data or {}
+
+        veh = d.get("vehLedStatus")
+
+        if veh is None:
+            rc = d.get("robotConfig")
+            if isinstance(rc, dict):
+                veh = rc.get("vehLedStatus")
+            elif rc is not None:
+                veh = getattr(rc, "vehLedStatus", None)
+
+        if veh is None:
+            return None
+
+        # Verified against the cloud shadow:
+        # vehLedStatus = 3 -> ON
+        # vehLedStatus = 4 -> OFF   (same encoding as camLedStatus)
+        return int(veh) == 3
+
+    @property
+    def available(self) -> bool:
+        d = self.coordinator.data or {}
+        return super().available and (
+            d.get("vehLedStatus") is not None
+            or d.get("robotConfig") is not None
+        )
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self.coordinator.async_set_vehicle_led(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.coordinator.async_set_vehicle_led(False)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        d = self.coordinator.data or {}
+        return {
+            "veh_led_status": d.get("vehLedStatus"),
+            "state_mapping": {
+                "3": "on",
+                "4": "off",
+            },
+        }
+
+
 class LymowDockOnErrorSwitch(LymowEntity, SwitchEntity):
     """Switch to control whether mower returns to dock on error."""
 
@@ -280,3 +369,52 @@ class LymowDockOnErrorSwitch(LymowEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self.coordinator.async_set_dock_on_error(False)
+
+
+class LymowDiagnosticCaptureSwitch(LymowEntity, SwitchEntity):
+    """Diagnostic Capture — writes the map's render-input snapshot to a file you can send to the
+    developers to reproduce a map issue. Local toggle, off by default, NOT sent to the mower."""
+
+    _attr_name = "Diagnostic Capture"
+    _attr_icon = "mdi:bug-outline"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_extra_state_attributes = {"description": "When ON, writes the map's render-input data (zones, channels, coverage trail, pass-coverage analysis, obstacles, anomalies, settings) to /config/lymow_diagnostic_<device>.json, refreshed every ~5 s. Flip on, reproduce the issue, flip off, download the file (Samba / File editor / VS Code add-on) and send it to the developers. Contains your yard's GPS layout — share only with devs. Off by default; resets off on restart."}
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "diagnostic_capture")
+
+    @property
+    def is_on(self) -> bool:
+        return bool(getattr(self.coordinator, "_diag_capture", False))
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.set_diag_capture(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.set_diag_capture(False)
+
+
+class LymowDimByAgeSwitch(LymowEntity, SwitchEntity):
+    """Dim Coverage By Age — when ON, the stripe coverage styles (Green Checker / Logical
+    Passes / Gradient / Activity) are dimmed per zone by how long since that zone was last
+    mowed: freshly-mowed zones stay bright, overdue ones go darker/duller (using the same
+    Mow Interval as the Zone Age style and Overdue sensor). The stripes stay visible through
+    the dimming. Local setting, persisted, NOT sent to the mower."""
+
+    _attr_name = "Dim Coverage By Age"
+    _attr_icon = "mdi:brightness-4"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_extra_state_attributes = {"description": "Dims the striped coverage map per zone by mow-age (older = darker), so you can see at a glance what's overdue without leaving your normal Green Checker / Logical Passes view. Uses the Mow Interval as the scale. Does not affect the dedicated 'Zone Age' coverage style. Local; persisted."}
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "dim_by_age")
+
+    @property
+    def is_on(self) -> bool:
+        return bool((self.coordinator.data or {}).get("dim_by_age", False))
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.set_dim_by_age(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.set_dim_by_age(False)

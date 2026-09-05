@@ -33,6 +33,25 @@ from .entity_base import LymowEntity
 @dataclass(frozen=True, kw_only=True)
 class LymowBinDesc(BinarySensorEntityDescription):
     value_fn: Callable[[dict], bool] = lambda d: False
+    description: str | None = None   # surfaced as a more-info attribute
+
+
+def _current_net(d: dict) -> int | None:
+    """currentNet, robust to netDetailInfo being a raw protobuf object.
+
+    state.py stores netDetailInfo as the protobuf message (no `.get()`), but also
+    flattens currentNet to a top-level key when present — prefer that. Calling
+    `.get()` on the protobuf object was raising AttributeError every update while a
+    mow was active (netDetailInfo populated), spamming the log and breaking the
+    WiFi/4G connectivity sensors.
+    """
+    v = d.get("currentNet")
+    if v is not None:
+        return v
+    nd = d.get("netDetailInfo")
+    if isinstance(nd, dict):
+        return nd.get("currentNet")
+    return getattr(nd, "currentNet", None)
 
 
 BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
@@ -70,6 +89,7 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         name="Error",
         device_class=BinarySensorDeviceClass.PROBLEM,
         icon="mdi:alert",
+        description="WHETHER the mower currently has a fault — ON for an active error or emergency-stop, OFF when healthy. This is the on/off flag (good for automations/alerts); the 'Error Detail' sensor says WHAT the fault is.",
         value_fn=lambda d: (
             d.get("workStatus") in (WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP)
             or bool(d.get("errorCode") and d.get("errorCode") != 0)
@@ -81,7 +101,7 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         icon="mdi:wifi",
         value_fn=lambda d: bool(d.get(F_WIFI_WORKING))
-            or (d.get("netDetailInfo") or {}).get("currentNet") == 1,
+            or _current_net(d) == 1,
         entity_registry_enabled_default=False,
     ),
     LymowBinDesc(
@@ -90,22 +110,17 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         icon="mdi:signal-4g",
         value_fn=lambda d: bool(d.get(F_LTE_WORKING))
-            or (d.get("netDetailInfo") or {}).get("currentNet") == 2,
-        entity_registry_enabled_default=False,
-    ),
-    LymowBinDesc(
-        key="rain_delay",
-        name="Rain Delay",
-        device_class=BinarySensorDeviceClass.MOISTURE,
-        icon="mdi:weather-rainy",
-        value_fn=lambda d: bool(d.get("rainDelay") or d.get("rain_delay")),
+            or _current_net(d) == 2,
         entity_registry_enabled_default=False,
     ),
 
     LymowBinDesc(
         key="theft_detection",
-        name="Theft Detection",
-        device_class=BinarySensorDeviceClass.SAFETY,
+        # Restored wording from the fix-rtk-version line (lost in the move to
+        # beta.4). NOTE: no SAFETY device_class — theftDetectionSwitch=on means
+        # anti-theft is ENABLED (good), but SAFETY renders "on" as "Unsafe",
+        # which inverts the meaning. Plain on/off reads correctly as a status.
+        name="Anti-Theft",
         icon="mdi:shield-lock",
         value_fn=lambda d: bool(d.get("theftDetectionSwitch")),
         entity_registry_enabled_default=False,
@@ -161,3 +176,9 @@ class LymowBinarySensor(LymowEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool:
         return self.entity_description.value_fn(self.coordinator.data or {})
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        if self.entity_description.description:
+            return {"description": self.entity_description.description}
+        return None

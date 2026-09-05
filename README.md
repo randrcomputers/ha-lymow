@@ -1,16 +1,29 @@
 # 🌿 Lymow Home Assistant Integration
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
-[![GitHub release](https://img.shields.io/github/release/d3dfantasy99/Lymow-HA.svg)](https://github.com/d3dfantasy99/Lymow-HA/releases)
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Discord](https://img.shields.io/discord/rPyv8mcB?label=Discord&logo=discord)](https://discord.gg/8kmYsP6ZRv)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/d3dfantasy99)
 
 Unofficial Home Assistant integration for the **Lymow robot lawn mower**.  
 Control your robot, monitor its status, view zones and map — all from Home Assistant.
 
+**Maintained fork** of [d3dfantasy99/Lymow-HA](https://github.com/d3dfantasy99/Lymow-HA) (`2.1.15-beta.4`), published as **2.1.16**. The original author has been inactive; this repo exists so the integration keeps working on current Home Assistant.
+
 > ⚠️ **This integration is not affiliated with or endorsed by Lymow.**  
 > It was built by reverse engineering the official Lymow Android app.
+
+### Fork notes (2.1.16)
+
+Home Assistant **2026.9.0** (Python 3.14) was crashing the map camera with:
+
+`Lymow map render failed - BrokenProcessPool: A child process terminated abruptly, the process pool is not usable anymore`
+
+2.1.15-beta defaults to rendering the map and coverage math in a `ProcessPoolExecutor`. When that child process dies, the pool is unusable until a reload. This fork:
+
+- Defaults **Render map in a separate process** to **off**
+- Falls back to in-process render if the pool dies anyway
+- Recovers coverage compute the same way
+
+If you already had the option enabled, turn it off under **Settings → Devices & services → Lymow → Configure**, then reload.
 
 ---
 
@@ -49,20 +62,19 @@ Control your robot, monitor its status, view zones and map — all from Home Ass
 1. Make sure [HACS](https://hacs.xyz) is installed in your Home Assistant instance.
 2. Click the button below to add this repository to HACS:
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=d3dfantasy99&repository=Lymow-HA&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=randrcomputers&repository=ha-lymow&category=integration)
 
 Or manually:
 - Go to **HACS → Integrations → ⋮ → Custom repositories**
-- Add `https://github.com/d3dfantasy99/Lymow-HA` as an **Integration**
+- Add `https://github.com/randrcomputers/ha-lymow` as an **Integration**
 - Search for **Lymow** and click **Download**
 
 3. Restart Home Assistant.
 
 ### Manual installation
 
-1. Download the [latest release](https://github.com/d3dfantasy99/Lymow-HA/releases/latest).
-2. Copy the `custom_components/lymow` folder into your HA `config/custom_components/` directory.
-3. Restart Home Assistant.
+1. Copy the `custom_components/lymow` folder into your HA `config/custom_components/` directory.
+2. Restart Home Assistant.
 
 ---
 
@@ -204,6 +216,18 @@ service: lymow.cancel_task
 
 ---
 
+## Coverage & mow history
+
+Per-zone coverage and last-mowed times **persist across restarts and new mows** — they're
+saved to the integration's config entry, not just held in memory. Each zone keeps its mowed
+footprint on the map, tinted by **mow-age** (brighter = mowed more recently, fading as it
+ages past your **Mow Interval**), and the **Overdue Zones** / **Zone Age** sensors track how
+long it's been since each zone was last cut. A zone you mowed last week still shows its
+coverage today, and starting a fresh task only clears the zone(s) actually being mowed — so a
+partial mow never wipes the rest of the map.
+
+---
+
 ## Session history automations
 
 The `event.lymow_<<mowername>>_last_session` entity fires whenever a new completed session is detected. Use it to send a notification when mowing finishes:
@@ -252,6 +276,57 @@ entities:
       color: "#ff6f00"
       fill_opacity: 0
 ```
+
+---
+
+## Example automations
+
+### Alert if the mower leaves its mapped area
+
+The **Location State** sensor (`sensor.lymow_<<mowername>>_location_state`) reads `Docked`,
+`Zone: <name>`, `Channel: <label>`, `No Go: <name>`, or `Off-Map`. `No Go:` and `Off-Map` are
+geofence breaches (also exposed via the `is_breach` attribute), so you can notify or alarm the
+moment the mower goes where it shouldn't:
+
+```yaml
+automation:
+  - alias: "Lymow left its mapped area"
+    trigger:
+      - platform: state
+        entity_id: sensor.lymow_<<mowername>>_location_state
+        to: "Off-Map"
+        for: "00:00:30"            # debounce brief GPS wobble
+    action:
+      - service: notify.notify
+        data:
+          message: "⚠️ Lymow is outside its mapped area (possible theft, or stuck off-map)."
+```
+
+### Sound the theft alarm if it leaves the yard
+
+Combine the Location State sensor with the mower's built-in audio — play its **Theft Alarm**
+clip when it goes Off-Map:
+
+```yaml
+automation:
+  - alias: "Lymow theft alarm"
+    trigger:
+      - platform: state
+        entity_id: sensor.lymow_<<mowername>>_location_state
+        to: "Off-Map"
+        for: "00:00:30"
+    action:
+      - service: lymow.play_sound
+        data:
+          audio_id: 31              # 31 = Theft Alarm
+```
+
+### Playing sounds
+
+Use the **Play Sound** select (pick a clip; it auto-resets to `None`) or call the
+`lymow.play_sound` service with `audio_id` — these are the mower's own **built-in audio
+clips** (e.g. `30` Stop Button Pressed, `31` Theft Alarm, `32` Cutting Started), not custom
+tones. Fire-and-forget: the mower has no audio feedback, so the select snaps back after firing.
 
 ---
 
@@ -304,7 +379,7 @@ If you find this integration useful, you can support its development:
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/d3dfantasy99)
 
-To report a bug or request a feature, please [open an issue](https://github.com/d3dfantasy99/Lymow-HA/issues) on GitHub.
+To report a bug or request a feature, please [open an issue](https://github.com/randrcomputers/ha-lymow/issues) on GitHub.
 
 ---
 
